@@ -1,0 +1,42 @@
+{
+  "name": "claude-sessions",
+  "version": "0.1.0",
+  "description": "Read Claude Code session data (sessions, projects, tasks, teams, costs) without running lm-assist",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "data/"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "sessions",
+    "jsonl",
+    "parser"
+  ],
+  "author": "langmartai",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/langmartai/claude-sessions.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "lmdb": "^3.5.1"
+  },
+  "optionalDependencies": {
+    "chokidar": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0"
+  }
+}
