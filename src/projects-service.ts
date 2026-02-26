@@ -10,7 +10,6 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { homedir } from 'os';
 import { execFileSync } from 'child_process';
 import {
   getProjectsDir,
@@ -290,48 +289,83 @@ export class ProjectsService {
   getGitInfo(projectPath: string): GitInfo | null {
     if (!fs.existsSync(projectPath)) return null;
 
-    try {
-      const opts = { cwd: projectPath, timeout: 5000 };
-
-      const isGit = (() => {
-        try {
-          execFileSync('git', ['rev-parse', '--is-inside-work-tree'], opts);
-          return true;
-        } catch {
-          return false;
-        }
-      })();
-
-      if (!isGit) return null;
-
-      const branch = (() => {
-        try {
-          return execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], opts).toString().trim() || null;
-        } catch {
-          return null;
-        }
-      })();
-
-      const headCommit = (() => {
-        try {
-          return execFileSync('git', ['rev-parse', '--short', 'HEAD'], opts).toString().trim() || null;
-        } catch {
-          return null;
-        }
-      })();
-
-      const isBare = (() => {
-        try {
-          return execFileSync('git', ['rev-parse', '--is-bare-repository'], opts).toString().trim() === 'true';
-        } catch {
-          return false;
-        }
-      })();
-
-      const remotes: GitRemote[] = [];
+    const execGit = (args: string[]): string | null => {
       try {
-        const remotesOutput = execFileSync('git', ['remote', '-v'], opts).toString().trim();
-        for (const line of remotesOutput.split('\n')) {
+        return execFileSync('git', args, {
+          cwd: projectPath,
+          encoding: 'utf-8',
+          timeout: 5000,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        }).trim();
+      } catch {
+        return null;
+      }
+    };
+
+    try {
+      // Check if inside a git repo
+      const topLevel = execGit(['rev-parse', '--is-inside-work-tree']);
+      if (topLevel !== 'true') return null;
+
+      // Current branch
+      let branch: string | null = execGit(['rev-parse', '--abbrev-ref', 'HEAD']);
+      if (branch === 'HEAD') branch = null; // detached HEAD
+
+      // HEAD commit
+      const headCommit = execGit(['rev-parse', '--short', 'HEAD']);
+
+      // Check bare repo
+      const isBare = execGit(['rev-parse', '--is-bare-repository']) === 'true';
+
+      // Worktree detection
+      const gitDir = execGit(['rev-parse', '--git-dir']);
+      const isWorktree = gitDir !== null && gitDir.includes('.git/worktrees');
+      let mainWorktreePath: string | null = null;
+      if (isWorktree) {
+        mainWorktreePath = execGit(['rev-parse', '--path-format=absolute', '--git-common-dir']);
+        if (mainWorktreePath && mainWorktreePath.endsWith('/.git')) {
+          mainWorktreePath = mainWorktreePath.slice(0, -5);
+        } else if (mainWorktreePath && mainWorktreePath.endsWith('\\.git')) {
+          mainWorktreePath = mainWorktreePath.slice(0, -5);
+        }
+      }
+
+      // List worktrees
+      const worktrees: GitInfo['worktrees'] = [];
+      const worktreeOutput = execGit(['worktree', 'list', '--porcelain']);
+      if (worktreeOutput) {
+        const entries = worktreeOutput.split('\n\n').filter(Boolean);
+        for (const entry of entries) {
+          const lines = entry.split('\n');
+          let wtPath = '';
+          let wtBranch: string | null = null;
+          let wtHead = '';
+          for (const line of lines) {
+            if (line.startsWith('worktree ')) wtPath = line.slice(9);
+            else if (line.startsWith('HEAD ')) wtHead = line.slice(5, 12); // short hash
+            else if (line.startsWith('branch ')) {
+              wtBranch = line.slice(7);
+              if (wtBranch.startsWith('refs/heads/')) wtBranch = wtBranch.slice(11);
+            }
+          }
+          if (wtPath) {
+            const normalizedWtPath = wtPath.replace(/\\/g, '/');
+            const normalizedProjectPath = projectPath.replace(/\\/g, '/');
+            worktrees.push({
+              path: wtPath,
+              branch: wtBranch,
+              head: wtHead,
+              isCurrent: normalizedWtPath === normalizedProjectPath,
+            });
+          }
+        }
+      }
+
+      // Remotes
+      const remotes: GitRemote[] = [];
+      const remoteOutput = execGit(['remote', '-v']);
+      if (remoteOutput) {
+        for (const line of remoteOutput.split('\n')) {
           const match = line.match(/^(\S+)\s+(\S+)\s+\((fetch|push)\)/);
           if (match) {
             remotes.push({
@@ -341,17 +375,15 @@ export class ProjectsService {
             });
           }
         }
-      } catch {
-        // Ignore
       }
 
       return {
         initialized: true,
         branch,
         isBare,
-        isWorktree: false,
-        mainWorktreePath: null,
-        worktrees: [],
+        isWorktree,
+        mainWorktreePath,
+        worktrees,
         remotes,
         headCommit,
       };
