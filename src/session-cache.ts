@@ -834,16 +834,17 @@ export class SessionCache {
                 });
               }
 
-              if (block.name === 'TeamCreate' && block.input) {
+              if (block.name === 'Teammate' && block.input) {
                 const input = block.input;
+                const op = (input.operation || 'spawnTeam') as 'spawnTeam' | 'cleanup';
                 updated.teamOperations.push({
-                  operation: 'spawnTeam',
+                  operation: op,
                   teamName: input.team_name,
                   description: input.description,
                   turnIndex,
                   lineIndex: msg.lineIndex,
                 });
-                if (input.team_name) {
+                if (op === 'spawnTeam' && input.team_name) {
                   if (!updated.allTeams.includes(input.team_name)) {
                     updated.allTeams.push(input.team_name);
                   }
@@ -1469,6 +1470,128 @@ export class SessionCache {
     }
 
     return costMap;
+  }
+
+  getRawMessagesSync(sessionPath: string): Array<any & { lineIndex: number }> | null {
+    if (!fs.existsSync(sessionPath)) {
+      return null;
+    }
+
+    const stats = fs.statSync(sessionPath);
+
+    let cache = this.store.getRawMessages(sessionPath);
+
+    const validity = this.isRawCacheValid(cache || null, stats);
+
+    if (validity === 'valid' && cache) {
+      return cache.messages;
+    }
+
+    if (validity === 'append' && cache) {
+      const content = fs.readFileSync(sessionPath, 'utf-8');
+      const lines = content.split('\n');
+      const newMessages: Array<any & { lineIndex: number }> = [];
+
+      for (let lineIndex = cache.lastLineIndex + 1; lineIndex < lines.length; lineIndex++) {
+        const line = lines[lineIndex];
+        if (line.trim()) {
+          try {
+            const msg = JSON.parse(line);
+            newMessages.push({ ...msg, lineIndex });
+          } catch {
+            // Skip invalid JSON
+          }
+        }
+      }
+
+      if (newMessages.length > 0) {
+        cache.messages.push(...newMessages);
+        cache.lastLineIndex = lines.length - 1;
+        cache.fileSize = stats.size;
+        cache.fileMtime = stats.mtime.getTime();
+
+        this.store.putRawMessages(sessionPath, cache).catch(() => {});
+      }
+
+      return cache.messages;
+    }
+
+    const content = fs.readFileSync(sessionPath, 'utf-8');
+    const lines = content.split('\n');
+    const messages: Array<any & { lineIndex: number }> = [];
+
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      const line = lines[lineIndex];
+      if (line.trim()) {
+        try {
+          const msg = JSON.parse(line);
+          messages.push({ ...msg, lineIndex });
+        } catch {
+          // Skip invalid JSON
+        }
+      }
+    }
+
+    const rawCache: RawMessagesCache = {
+      version: CACHE_VERSION,
+      sessionId: path.basename(sessionPath, '.jsonl'),
+      fileSize: stats.size,
+      fileMtime: stats.mtime.getTime(),
+      lastLineIndex: lines.length - 1,
+      messages,
+    };
+
+    this.store.putRawMessages(sessionPath, rawCache).catch(() => {});
+
+    return messages;
+  }
+
+  getSubagentSessionsFromCache(projectPath: string, sessionId: string): Array<{
+    filePath: string;
+    cacheData: SessionCacheData;
+  }> {
+    const projectKey = legacyEncodeProjectPath(projectPath);
+    const subagentsDir = path.join(os.homedir(), '.claude', 'projects', projectKey, sessionId, 'subagents');
+
+    if (!fs.existsSync(subagentsDir)) return [];
+
+    let agentFiles: string[];
+    try {
+      agentFiles = fs.readdirSync(subagentsDir)
+        .filter(f => f.startsWith('agent-') && f.endsWith('.jsonl'));
+    } catch {
+      return [];
+    }
+
+    const results: Array<{ filePath: string; cacheData: SessionCacheData }> = [];
+    for (const file of agentFiles) {
+      const filePath = path.join(subagentsDir, file);
+      const cacheData = this.getSessionDataSync(filePath);
+      if (cacheData) {
+        results.push({ filePath, cacheData });
+      }
+    }
+
+    return results;
+  }
+
+  isProjectCached(projectPath: string): boolean {
+    const projectKey = legacyEncodeProjectPath(projectPath);
+    const projectsDir = path.join(os.homedir(), '.claude', 'projects', projectKey);
+
+    if (!fs.existsSync(projectsDir)) return true;
+
+    const files = fs.readdirSync(projectsDir)
+      .filter(f => f.endsWith('.jsonl') && !f.startsWith('agent-'));
+
+    for (const file of files) {
+      const filePath = path.join(projectsDir, file);
+      if (!this.store.getSessionData(filePath)) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   getStats(): { memoryCacheSize: number; diskCacheCount: number; diskCacheSize: number } {
