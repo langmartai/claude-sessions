@@ -134,7 +134,3 @@ Token cost calculation with tiered pricing.
 ## Optional Dependencies
 
 - **chokidar** — File watching for live cache updates. Install with `npm install chokidar` if you need `SessionCache.startWatching()`.
-
-## License
-
-MIT
