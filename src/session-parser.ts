@@ -12,8 +12,7 @@ import * as os from 'os';
 import * as readline from 'readline';
 import { legacyEncodeProjectPath } from './utils/path-utils';
 import { CostCalculator } from './cost-calculator';
-import type { SessionCacheData, CachedToolUse } from './session-cache';
-import { isRealUserPrompt } from './session-cache';
+import type { SessionCacheData, CachedToolUse, CachedModelUsage, PromptType } from './session-cache';
 
 // ============================================================================
 // Types
@@ -90,6 +89,8 @@ export interface ClaudeToolUse {
   id: string;
   name: string;
   input: any;
+  turnIndex?: number;
+  lineIndex?: number;
 }
 
 export type FileActionCategory = 'read' | 'write' | 'execute' | 'search' | 'navigation' | 'other';
@@ -140,6 +141,8 @@ export interface ClaudeUserPrompt {
   text: string;
   images?: number;
   timestamp?: string;
+  /** Classification: undefined/'user' = real prompt, others = system-injected */
+  promptType?: PromptType;
 }
 
 export interface CompactMessageSummary {
@@ -192,6 +195,16 @@ export interface ClaudeSessionData {
     cacheCreationInputTokens: number;
     cacheReadInputTokens: number;
   };
+  modelUsage?: Record<string, {
+    inputTokens: number;
+    outputTokens: number;
+    cacheCreationInputTokens: number;
+    cacheReadInputTokens: number;
+    costUsd: number;
+    messageCount: number;
+  }>;
+  isActive?: boolean;
+  lastActivityAt?: Date;
   result?: string;
   errors?: string[];
   success: boolean;
@@ -302,20 +315,22 @@ export function convertCacheToSessionData(
   filePath: string,
   stats: fs.Stats
 ): ClaudeSessionData {
-  const userPrompts: ClaudeUserPrompt[] = cache.userPrompts
-    .filter(isRealUserPrompt)
-    .map(p => ({
-      turnIndex: p.turnIndex,
-      lineIndex: p.lineIndex,
-      text: p.text,
-      images: p.images,
-      timestamp: p.timestamp,
-    }));
+  // Convert user prompts — pass ALL through with promptType (matching original behavior)
+  const userPrompts: ClaudeUserPrompt[] = cache.userPrompts.map(p => ({
+    turnIndex: p.turnIndex,
+    lineIndex: p.lineIndex,
+    text: p.text,
+    images: p.images,
+    timestamp: p.timestamp,
+    promptType: p.promptType,
+  }));
 
   const toolUses: ClaudeToolUse[] = cache.toolUses.map(t => ({
     id: t.id,
     name: t.name,
     input: t.input,
+    turnIndex: t.turnIndex,
+    lineIndex: t.lineIndex,
   }));
 
   const tasks = cache.tasks.map(t => ({
@@ -346,14 +361,46 @@ export function convertCacheToSessionData(
     runInBackground: s.runInBackground,
   }));
 
-  let status: SessionStatus = 'unknown';
-  if (cache.success) {
+  // Determine session status with time-based heuristics (matching original behavior)
+  const lastTimestamp = cache.lastTimestamp ? new Date(cache.lastTimestamp) : null;
+  const now = Date.now();
+  const msSinceModified = now - stats.mtime.getTime();
+  const msSinceLastActivity = lastTimestamp ? now - lastTimestamp.getTime() : Infinity;
+  const msSinceActivity = Math.min(msSinceModified, msSinceLastActivity);
+
+  const RUNNING_THRESHOLD = 60_000;      // 1 minute
+  const IDLE_THRESHOLD = 10 * 60_000;    // 10 minutes
+
+  const hasResultMessage = cache.result !== undefined || cache.durationMs > 0;
+  const hasAssistantResponse = cache.responses.length > 0;
+
+  let status: SessionStatus;
+  let isActive: boolean;
+
+  if (hasResultMessage && cache.success) {
     status = 'completed';
-  } else if (cache.errors && cache.errors.length > 0) {
+    isActive = false;
+  } else if (hasResultMessage && cache.errors && cache.errors.length > 0) {
     status = 'error';
-  } else if (cache.result !== undefined) {
+    isActive = false;
+  } else if (msSinceActivity < RUNNING_THRESHOLD) {
+    status = 'running';
+    isActive = true;
+  } else if (hasAssistantResponse && msSinceActivity >= IDLE_THRESHOLD) {
     status = 'completed';
+    isActive = false;
+  } else if (msSinceActivity < IDLE_THRESHOLD) {
+    status = 'idle';
+    isActive = false;
+  } else {
+    status = 'stale';
+    isActive = false;
   }
+
+  // Per-model usage breakdown
+  const modelUsage = cache.modelUsage && Object.keys(cache.modelUsage).length > 0
+    ? Object.fromEntries(Object.entries(cache.modelUsage).map(([k, v]) => [k, { ...v }]))
+    : undefined;
 
   return {
     sessionId: cache.sessionId || sessionId,
@@ -377,6 +424,9 @@ export function convertCacheToSessionData(
     totalCostUsd: cache.totalCostUsd || cache.cumulativeCostUsd || 0,
     durationMs: cache.durationMs,
     usage: cache.usage,
+    modelUsage,
+    isActive,
+    lastActivityAt: lastTimestamp || undefined,
     result: cache.result,
     errors: cache.errors,
     success: cache.success,
@@ -528,6 +578,8 @@ export class SessionParser {
                 id: block.id,
                 name: block.name,
                 input: block.input,
+                turnIndex,
+                lineIndex: msg.lineIndex || 0,
               });
 
               if (block.name === 'Task' && block.input) {
@@ -586,11 +638,16 @@ export class SessionParser {
       ).totalCost;
     }
 
-    // If no result message, try to determine status
+    // If no result message, try to determine status using time-based heuristics
     if (status === 'unknown') {
-      const lastMsg = messages[messages.length - 1];
-      if (lastMsg?.type === 'assistant') {
+      const now = Date.now();
+      const msSinceModified = now - stats.mtime.getTime();
+      if (msSinceModified < 60_000) {
         status = 'running';
+      } else if (msSinceModified < 10 * 60_000) {
+        status = 'idle';
+      } else {
+        status = 'stale';
       }
     }
 
